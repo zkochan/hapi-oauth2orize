@@ -1,5 +1,5 @@
 {
-  "name": "hapi-oauth2orize",
+  "name": "zkochan/hapi-oauth2orize",
   "description": "Wrapper around OAuth2orize for hapi",
   "version": "1.4.0",
   "main": "index.js",
