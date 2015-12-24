@@ -16,7 +16,7 @@ var internals = {
 /*eslint camelcase: [1, {properties: "never"}]*/
 exports.register = function(server, options, next) {
   // Need session support for transaction in authorization code grant
-  server.dependency('yar');
+  server.dependency('humble-session');
 
   internals.settings = Hoek.applyToDefaults(internals.defaults, options);
 
@@ -76,43 +76,47 @@ internals.errorHandler = function(options) {
 };
 
 internals.authorize = function(request, reply, callback, options, validate, immediate) {
-  var express = internals.convertToExpress(request, reply);
-  internals.OauthServer.authorize(options, validate, immediate)(express.req, express.res, function(err) {
+  internals.convertToExpress(request, reply, function(err, express) {
+    if (err) return;
 
-    if (err) {
-      internals.errorHandler({mode: 'indirect'})(err, express.req, express.res,
-            function() {
-              internals.errorHandler({mode: 'direct'})(err, express.req, express.res, console.log);
-            });
-    }
+    internals.OauthServer.authorize(options, validate, immediate)(express.req, express.res, function(err) {
+      if (err) {
+        internals.errorHandler({mode: 'indirect'})(err, express.req, express.res,
+          function() {
+            internals.errorHandler({mode: 'direct'})(err, express.req, express.res, console.log);
+          });
+      }
 
-    callback(express.req, express.res);
+      callback(express.req, express.res);
+    });
   });
-
 };
 
 internals.decision = function(request, reply, options, parse) {
   var result;
-  var express = internals.convertToExpress(request, reply);
-  var handler = function(err) {
-    if (err) {
-      internals.errorHandler()(err, express.req, express.res, console.log);
-    }
-  };
+  internals.convertToExpress(request, reply, function(err, express) {
+    if (err) return;
 
-  options = options || {};
-
-  if (options && options.loadTransaction === false) {
-    internals.OauthServer.decision(options, parse)(express.req, express.res, handler);
-  } else {
-    result = internals.OauthServer.decision(options, parse);
-    result[0](express.req, express.res, function(err) {
+    var handler = function(err) {
       if (err) {
-        console.log('Err2: ' + err);
+        internals.errorHandler()(err, express.req, express.res, console.log);
       }
-      result[1](express.req, express.res, handler);
-    });
-  }
+    };
+
+    options = options || {};
+
+    if (options && options.loadTransaction === false) {
+      internals.OauthServer.decision(options, parse)(express.req, express.res, handler);
+    } else {
+      result = internals.OauthServer.decision(options, parse);
+      result[0](express.req, express.res, function(err) {
+        if (err) {
+          console.log('Err2: ' + err);
+        }
+        result[1](express.req, express.res, handler);
+      });
+    }
+  });
 };
 
 internals.serializeClient = function(fn) {
@@ -124,12 +128,14 @@ internals.deserializeClient = function(fn) {
 };
 
 internals.token = function(request, reply, options) {
-  var express = internals.convertToExpress(request, reply);
-  internals.OauthServer.token(options)(express.req, express.res, function(err) {
+  internals.convertToExpress(request, reply, function(err, express) {
+    if (err) return;
 
-    if (err) {
-      internals.errorHandler()(err, express.req, express.res, console.log);
-    }
+    internals.OauthServer.token(options)(express.req, express.res, function(err) {
+      if (err) {
+        internals.errorHandler()(err, express.req, express.res, console.log);
+      }
+    });
   });
 };
 
@@ -183,91 +189,84 @@ internals.oauthToBoom = function(oauthError) {
   return newResponse;
 };
 
-internals.convertToExpress = function(request, reply) {
+internals.convertToExpress = function(request, reply, cb) {
+  request.getSession(function(err, session) {
+    if (err) return cb(err);
 
-  request.session.lazy(true);
+    var ExpressServer = {
+      req: {
+        session: request.session,
+        query: request.query,
+        body: request.payload,
+        user: Hoek.reach(request.auth.credentials, internals.settings.credentialsUserProperty || '',
+            {default: request.auth.credentials})
+      },
+      res: {
+        redirect: function(uri) {
+          // map errors in URL to be similar to our custom Boom errors.
+          var uriObj = Url.parse(uri, true);
 
-  var ExpressServer = {
-    req: {
-      session: request.session,
-      query: request.query,
-      body: request.payload,
-      user: Hoek.reach(request.auth.credentials, internals.settings.credentialsUserProperty || '',
-          {default: request.auth.credentials})
-    },
-    res: {
-      redirect: function(uri) {
-
-        // map errors in URL to be similar to our custom Boom errors.
-        var uriObj = Url.parse(uri, true);
-
-        if (uriObj.query.error) {
-
-          // Hide detailed server error messages
-          if (uriObj.query.error === 'server_error') {
-            uriObj.query.error_description = 'An internal server error occurred';
+          if (uriObj.query.error) {
+            // Hide detailed server error messages
+            if (uriObj.query.error === 'server_error') {
+              uriObj.query.error_description = 'An internal server error occurred';
+            }
+            uri = Url.format(uriObj);
           }
 
-          uri = Url.format(uriObj);
-        }
-
-        reply.redirect(uri);
-      },
-      setHeader: function(header, value) {
-
-        ExpressServer.headers.push([header, value]);
-      },
-      end: function(content) {
-
-        // Transform errors to be handled as Boomers
-        if (typeof content === 'string') {
-          var jsonContent;
-          try {
-            jsonContent = JSON.parse(content);
-          } catch (e) {
-            /* If we got a json error, ignore it.
-             * The oauth2orize's response just wasn't json.
-             */
-          }
-
-          // If we have a json response and it's an error, let's Boomify/normalize it!
-          if (jsonContent) {
-            if (jsonContent.error && this.statusCode) {
-              content = Boom.create(this.statusCode, null, jsonContent);
-
-              // Transform Boom error using jsonContent data attached to it
-              internals.transformBoomError(content);
-
-              // Now that we have a Boom object, we can let Hapi handle headers and status codes
-              ExpressServer.headers = [];
-              this.statusCode = null;
-
-            } else {
-              // Respond non-error content as a json object if it is json.
-              content = jsonContent;
+          reply.redirect(uri);
+        },
+        setHeader: function(header, value) {
+          ExpressServer.headers.push([header, value]);
+        },
+        end: function(content) {
+          // Transform errors to be handled as Boomers
+          if (typeof content === 'string') {
+            var jsonContent;
+            try {
+              jsonContent = JSON.parse(content);
+            } catch (e) {
+              /* If we got a json error, ignore it.
+               * The oauth2orize's response just wasn't json.
+               */
             }
 
+            // If we have a json response and it's an error, let's Boomify/normalize it!
+            if (jsonContent) {
+              if (jsonContent.error && this.statusCode) {
+                content = Boom.create(this.statusCode, null, jsonContent);
+
+                // Transform Boom error using jsonContent data attached to it
+                internals.transformBoomError(content);
+
+                // Now that we have a Boom object, we can let Hapi handle headers and status codes
+                ExpressServer.headers = [];
+                this.statusCode = null;
+
+              } else {
+                // Respond non-error content as a json object if it is json.
+                content = jsonContent;
+              }
+            }
           }
 
+          var response = reply(content);
+
+          // Non-boom error fallback
+          ExpressServer.headers.forEach(function(element) {
+            response.header(element[0], element[1]);
+          });
+
+          if (this.statusCode) {
+            response.code(this.statusCode);
+          }
         }
+      },
+      headers: []
+    };
 
-        var response = reply(content);
-
-        // Non-boom error fallback
-        ExpressServer.headers.forEach(function(element) {
-
-          response.header(element[0], element[1]);
-        });
-
-        if (this.statusCode) {
-          response.code(this.statusCode);
-        }
-      }
-    },
-    headers: []
-  };
-
-  return ExpressServer;
+    cb(null, ExpressServer);
+  });
 };
 
 exports.register.attributes = {
