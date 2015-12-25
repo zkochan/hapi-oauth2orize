@@ -195,6 +195,7 @@ internals.convertToExpress = function(request, reply, cb) {
 
     var ExpressServer = {
       req: {
+        oauth2: request.oauth2,
         session: request.session,
         query: request.query,
         body: request.payload,
