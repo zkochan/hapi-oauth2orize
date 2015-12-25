@@ -1,7 +1,7 @@
 {
   "name": "humble-oauth2orize",
   "description": "Wrapper around OAuth2orize for hapi",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "main": "index.js",
   "scripts": {
     "test": "./node_modules/.bin/lab -L"
